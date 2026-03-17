@@ -2,12 +2,14 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Resend } = require('resend');
-const Database = require('better-sqlite3');
+const Database = require('sqlite3');
 const path = require('path');
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: '*'
+}));
 
 // --- DATABASE INITIALIZATION ---
 const dbPath = path.join(__dirname, 'database.sqlite');
@@ -131,8 +133,12 @@ setInterval(() => {
     }
 }, 10 * 60 * 1000);
 
+app.get("/", (req, res) => {
+    res.send("Server is running 🚀");
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
     console.log(`Database initialized at: ${dbPath}`);
 });
