@@ -1,0 +1,5 @@
+[build]
+builder = "nixpacks"
+
+[env]
+NIXPACKS_INSTALL_CMD = "npm install"
