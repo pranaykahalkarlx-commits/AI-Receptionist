@@ -2,41 +2,37 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Resend } = require('resend');
-const { Pool } = require('pg');
-const jwt = require('jsonwebtoken');
+const Database = require('better-sqlite3');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// --- DATABASE INITIALIZATION (PostgreSQL) ---
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+// --- RAILWAY DATABASE INITIALIZATION ---
+// Use Railway Volume path if available (so data isn't deleted on restart)
+const DB_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+const dbPath = path.join(DB_DIR, 'database.sqlite');
 
-// Create OTPs table if it doesn't exist
-async function initDB() {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS otps (
-                email TEXT PRIMARY KEY,
-                otp TEXT NOT NULL,
-                expires_at BIGINT NOT NULL
-            )
-        `);
-        console.log('[DB] OTPs table ready.');
-    } catch (err) {
-        console.error('[DB] Failed to initialize database:', err);
-        process.exit(1); // Stop server if DB fails
-    }
+// Ensure the directory exists
+if (!fs.existsSync(DB_DIR)) {
+    fs.mkdirSync(DB_DIR, { recursive: true });
 }
 
-// Initialize Resend
-const resend = new Resend(process.env.RESEND_API_KEY);
+const db = new Database(dbPath);
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret_in_env';
+// Create OTPs table if it doesn't exist
+db.prepare(`
+    CREATE TABLE IF NOT EXISTS otps (
+        email TEXT PRIMARY KEY,
+        otp TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    )
+`).run();
+
+// Initialize Resend
+const resend = new Resend(process.env.RESEND_API_KEY || 're_your_api_key_here');
 
 // Helper to generate a 6-digit OTP
 function generateOTP() {
@@ -52,20 +48,14 @@ app.post('/api/auth/send-otp', async (req, res) => {
     }
 
     const otp = generateOTP();
-    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes from now
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
 
     try {
-        // Store OTP in PostgreSQL (upsert)
-        await pool.query(
-            `INSERT INTO otps (email, otp, expires_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (email) DO UPDATE SET otp = $2, expires_at = $3`,
-            [email, otp, expiresAt]
-        );
+        const upsert = db.prepare('INSERT OR REPLACE INTO otps (email, otp, expires_at) VALUES (?, ?, ?)');
+        upsert.run(email, otp, expiresAt);
 
-        // Send email using Resend
         const { data, error } = await resend.emails.send({
-            from: 'info@marketlly.shop',
+            from: 'info@marketlly.shop', // Ensure this domain is verified in Resend!
             to: email,
             subject: 'Your AI Receptionist Login Code',
             html: `
@@ -95,15 +85,15 @@ app.post('/api/auth/send-otp', async (req, res) => {
             return res.status(500).json({ success: false, message: error.message || 'Failed to send OTP email' });
         }
 
-        res.json({ success: true, message: 'OTP sent successfully' });
-    } catch (err) {
-        console.error('Unexpected error:', err);
+        res.json({ success: true, message: 'OTP sent successfully', data });
+    } catch (error) {
+        console.error('Unexpected error:', error);
         res.status(500).json({ success: false, message: 'Internal server error while sending email' });
     }
 });
 
 // 2. Endpoint to Verify OTP
-app.post('/api/auth/verify-otp', async (req, res) => {
+app.post('/api/auth/verify-otp', (req, res) => {
     const { email, otp } = req.body;
 
     if (!email || !otp) {
@@ -111,56 +101,47 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     }
 
     try {
-        const result = await pool.query('SELECT * FROM otps WHERE email = $1', [email]);
-        const row = result.rows[0];
+        const row = db.prepare('SELECT * FROM otps WHERE email = ?').get(email);
 
         if (!row) {
             return res.status(400).json({ success: false, message: 'No OTP requested for this email' });
         }
 
-        if (Date.now() > parseInt(row.expires_at)) {
-            await pool.query('DELETE FROM otps WHERE email = $1', [email]);
+        if (Date.now() > row.expires_at) {
+            db.prepare('DELETE FROM otps WHERE email = ?').run(email);
             return res.status(400).json({ success: false, message: 'OTP has expired' });
         }
 
         if (row.otp === otp) {
-            // Correct OTP — delete it so it can't be reused
-            await pool.query('DELETE FROM otps WHERE email = $1', [email]);
-
-            // Generate a real JWT token
-            const token = jwt.sign(
-                { email },
-                JWT_SECRET,
-                { expiresIn: '7d' }
-            );
-
-            res.json({ success: true, message: 'Authentication successful', token });
+            db.prepare('DELETE FROM otps WHERE email = ?').run(email);
+            res.json({ success: true, message: 'Authentication successful', token: 'mock_jwt_token_here' });
         } else {
             res.status(400).json({ success: false, message: 'Invalid OTP' });
         }
-    } catch (err) {
-        console.error('Database error:', err);
+    } catch (error) {
+        console.error('Database error:', error);
         res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
 // Periodic Cleanup: Delete expired OTPs every 10 minutes
-setInterval(async () => {
+setInterval(() => {
     const now = Date.now();
     try {
-        const result = await pool.query('DELETE FROM otps WHERE expires_at < $1', [now]);
-        if (result.rowCount > 0) {
-            console.log(`[Cleanup] Deleted ${result.rowCount} expired OTP records.`);
+        const info = db.prepare('DELETE FROM otps WHERE expires_at < ?').run(now);
+        if (info.changes > 0) {
+            console.log(`[Cleanup] Deleted ${info.changes} expired OTP records.`);
         }
-    } catch (err) {
-        console.error('[Cleanup Error]:', err);
+    } catch (error) {
+        console.error('[Cleanup Error]:', error);
     }
 }, 10 * 60 * 1000);
 
-// Start server AFTER DB is ready
+// Host MUST be 0.0.0.0 for Railway to expose the port correctly
 const PORT = process.env.PORT || 3000;
-initDB().then(() => {
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`Server running on port ${PORT}`);
-    });
+const HOST = '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT}`);
+    console.log(`Database initialized at: ${dbPath}`);
 });
